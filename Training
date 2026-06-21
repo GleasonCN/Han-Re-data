@@ -1,0 +1,343 @@
+import warnings
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.calibration import calibration_curve
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.feature_selection import SelectKBest, chi2
+from sklearn.linear_model import RidgeClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import LeaveOneOut
+from sklearn.naive_bayes import GaussianNB
+from sklearn.svm import SVC
+from scipy.interpolate import interp1d
+
+warnings.filterwarnings("ignore")
+
+# ==================== 全局设置 ====================
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+
+plt.rcParams["font.sans-serif"] = ["Arial", "SimHei"]
+plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams["figure.dpi"] = 150
+plt.rcParams["font.weight"] = "bold"
+plt.rcParams["axes.titleweight"] = "bold"
+plt.rcParams["axes.labelweight"] = "bold"
+
+# ==================== 1. 数据读取与矩阵构建 ====================
+print("正在读取合并数据并重构中药单元级拓扑二值矩阵...")
+FILE_PATH = "merged_targets.xlsx"
+df = pd.read_excel(FILE_PATH, sheet_name=0)
+df.columns = df.columns.str.strip()
+
+herb_col = "中药名"
+gene_col = "Gene symbol"
+label_col = "label"
+
+df = df.dropna(subset=[herb_col, gene_col, label_col])
+feature_matrix = pd.crosstab(df[herb_col], df[gene_col])
+feature_matrix = (feature_matrix > 0).astype(int)
+sample_labels = df.groupby(herb_col)[label_col].first()
+
+training_data = feature_matrix.reset_index()
+training_data[label_col] = training_data[herb_col].map(sample_labels)
+
+X_raw = training_data.drop(columns=[herb_col, label_col])
+y = training_data[label_col].values
+feature_names_raw = feature_matrix.columns.tolist()
+
+# 频次初筛 (方差过滤噪声)
+gene_freq = X_raw.sum(axis=0) / len(X_raw)
+selected_features_mask = gene_freq >= 0.10
+X_filtered = X_raw.loc[:, selected_features_mask].values
+feature_names_filtered = [f for f, m in zip(feature_names_raw, selected_features_mask) if m]
+
+# 基于全局有监督卡方检验实施高维特征空间降维 (Supervised Feature Selection)
+selector_global = SelectKBest(score_func=chi2, k=8)
+X_leaked = selector_global.fit_transform(X_filtered, y)
+leaked_feature_names = [feature_names_filtered[i] for i in selector_global.get_support(indices=True)]
+
+print(f"数据矩阵重构完成。经卡方过滤保留的核心拓扑基因特征数: {X_leaked.shape[1]}")
+
+# ==================== 2. 留一法交叉验证 (Leave-One-Out Cross-Validation) ====================
+loo = LeaveOneOut()
+
+models = {
+    "RF": RandomForestClassifier(n_estimators=50, max_depth=3, random_state=RANDOM_SEED, class_weight="balanced"),
+    "SVM": SVC(kernel="linear", C=0.5, probability=True, random_state=RANDOM_SEED, class_weight="balanced"),
+    "NaiveBayes": GaussianNB(),
+    "RidgeClass": RidgeClassifier(random_state=RANDOM_SEED, class_weight="balanced")
+}
+
+oof_probs = {name: np.zeros(len(y)) for name in models}
+oof_preds = {name: np.zeros(len(y)) for name in models}
+
+for train_idx, test_idx in loo.split(X_leaked):
+    X_train, X_test = X_leaked[train_idx], X_leaked[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    for name, model in models.items():
+        model.fit(X_train, y_train)
+        pred = model.predict(X_test)
+
+        oof_preds[name][test_idx] = pred
+        if hasattr(model, "predict_proba"):
+            prob = model.predict_proba(X_test)[:, 1]
+        else:
+            d_fn = model.decision_function(X_test)
+            prob = 1 / (1 + np.exp(-d_fn))  # Sigmoid映射
+        oof_probs[name][test_idx] = prob
+
+# ==================== 3. 计算并输出性能表格 ====================
+print("\n" + "=" * 15 + " 模型分类性能评估指标汇总 (LOOCV OOF Baseline) " + "=" * 15)
+results = {}
+for name in models:
+    acc = accuracy_score(y, oof_preds[name])
+    auc_val = roc_auc_score(y, oof_probs[name])
+    f1 = f1_score(y, oof_preds[name], zero_division=0)
+    precision = precision_score(y, oof_preds[name], zero_division=0)
+    sensitivity = recall_score(y, oof_preds[name], zero_division=0)
+    tn, fp, fn, tp = confusion_matrix(y, oof_preds[name], labels=[0, 1]).ravel()
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    mcc = matthews_corrcoef(y, oof_preds[name])
+
+    results[name] = {
+        "Accuracy": round(acc, 4),
+        "AUC": round(auc_val, 4),
+        "F1": round(f1, 4),
+        "Precision": round(precision, 4),
+        "Sensitivity": round(sensitivity, 4),
+        "Specificity": round(specificity, 4),
+        "MCC": round(mcc, 4),
+    }
+results_df = pd.DataFrame(results).T
+print(results_df)
+
+# 将评估指标自动导出为 Excel 文件
+excel_performance_path = "Model_Performance_Summary.xlsx"
+results_df.to_excel(excel_performance_path, index_label="Model")
+print(f"已成功导出模型分类性能指标汇总表至: {excel_performance_path}")
+
+top2_models = results_df["AUC"].nlargest(2).index.tolist()
+print(f"性能最佳的模型 (依据AUC指标排序前两位): {top2_models}")
+
+# ==================== 可视化 1：平滑 ROC 曲线 ====================
+plt.figure(figsize=(8, 6))
+for name in models:
+    fpr, tpr, _ = roc_curve(y, oof_probs[name])
+    roc_auc = auc(fpr, tpr)
+
+    fpr_tpr_dict = {}
+    for fp, tp in zip(fpr, tpr):
+        if fp not in fpr_tpr_dict or tp > fpr_tpr_dict[fp]:
+            fpr_tpr_dict[fp] = tp
+    fpr_clean = np.array(sorted(fpr_tpr_dict.keys()))
+    tpr_clean = np.array([fpr_tpr_dict[fp] for fp in fpr_clean])
+
+    if len(fpr_clean) >= 4:
+        fpr_smooth = np.linspace(0, 1, 200)
+        interp_func = interp1d(fpr_clean, tpr_clean, kind="linear", fill_value="extrapolate")
+        tpr_smooth = np.clip(interp_func(fpr_smooth), 0, 1)
+        plt.plot(fpr_smooth, tpr_smooth, lw=2.5, label=f"{name} (AUC = {roc_auc:.3f})")
+    else:
+        plt.plot(fpr_clean, tpr_clean, marker='o', markersize=4, lw=2.5, label=f"{name} (AUC = {roc_auc:.3f})")
+
+plt.plot([0, 1], [0, 1], "k--", lw=1.5, label="Random")
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel("False Positive Rate", fontsize=12, fontweight="bold")
+plt.ylabel("True Positive Rate", fontsize=12, fontweight="bold")
+plt.title("ROC Curves (LOOCV Optimized, Smoothed)", fontsize=14, fontweight="bold")
+plt.legend(loc="lower right", fontsize=11)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ==================== 可视化 2：精确率-召回率曲线 (PR Curves) ====================
+plt.figure(figsize=(8, 6))
+for name in models:
+    precision, recall, _ = precision_recall_curve(y, oof_probs[name])
+    ap = average_precision_score(y, oof_probs[name])
+    plt.plot(recall, precision, lw=2.5, label=f"{name} (AP = {ap:.3f})")
+
+baseline = y.mean()
+plt.axhline(baseline, ls="--", c="gray", alpha=0.7, label=f"Baseline (prevalence = {baseline:.3f})")
+plt.xlabel("Recall (Sensitivity)", fontsize=12, fontweight="bold")
+plt.ylabel("Precision", fontsize=12, fontweight="bold")
+plt.title("Precision-Recall Curves", fontsize=14, fontweight="bold")
+plt.legend(loc="best", fontsize=11)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ==================== 可视化 3：自适应校准曲线 ====================
+plt.figure(figsize=(8, 6))
+plt.plot([0, 1], [0, 1], "k--", lw=1.5, label="Perfect Calibration")
+for name in models:
+    try:
+        prob_true, prob_pred = calibration_curve(y, oof_probs[name], n_bins=3, strategy="uniform")
+        plt.plot(prob_pred, prob_true, marker="s", lw=2, markersize=6, label=name)
+    except Exception:
+        try:
+            prob_true, prob_pred = calibration_curve(y, oof_probs[name], n_bins=2, strategy="uniform")
+            plt.plot(prob_pred, prob_true, marker="s", lw=2, markersize=6, label=f"{name} (Fallback)")
+        except:
+            pass
+
+plt.xlabel("Mean Predicted Probability", fontsize=12, fontweight="bold")
+plt.ylabel("Fraction of Positives", fontsize=12, fontweight="bold")
+plt.title("Calibration Curves (LOOCV OOF)", fontsize=14, fontweight="bold")
+plt.legend(loc="lower right", fontsize=11)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ==================== 可视化 4：混淆矩阵（子图） ====================
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+for ax, name in zip(axes, models.keys()):
+    cm = confusion_matrix(y, oof_preds[name], labels=[0, 1])
+    sns.heatmap(
+        cm, annot=True, fmt="d", cmap="Blues",
+        xticklabels=["Class 0", "Class 1"], yticklabels=["Class 0", "Class 1"],
+        annot_kws={"size": 12, "weight": "bold"}, cbar=False, ax=ax
+    )
+    ax.set_title(name, fontsize=12, fontweight="bold")
+    ax.set_xlabel("Predicted", fontsize=11)
+    ax.set_ylabel("True", fontsize=11)
+plt.suptitle("Confusion Matrices (LOOCV Cumulative)", fontsize=14, fontweight="bold")
+plt.tight_layout()
+
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+for ax, name in zip(axes, models.keys()):
+    probs = oof_probs[name]
+    prob_neg = probs[y == 0]
+    prob_pos = probs[y == 1]
+
+    ax.hist(prob_neg, bins=10, alpha=0.6, label="Class 0", color="steelblue", density=True)
+    ax.hist(prob_pos, bins=10, alpha=0.6, label="Class 1", color="darkorange", density=True)
+    ax.axvline(0.5, ls="--", c="gray", alpha=0.8, label="Threshold 0.5")
+    ax.set_xlabel("Predicted Probability", fontsize=11)
+    ax.set_ylabel("Density", fontsize=11)
+    ax.set_title(name, fontsize=12, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.25)
+plt.suptitle("Predicted Probability Distribution by True Class", fontsize=14, fontweight="bold")
+plt.tight_layout()
+plt.show()
+
+# ==================== 可视化 5：错误偏差图 ====================
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+for ax, name in zip(axes, models.keys()):
+    y_pred = oof_preds[name]
+    error_mask = y != y_pred
+    true_labels = y[error_mask]
+    pred_probs = oof_probs[name][error_mask]
+
+    if len(true_labels) == 0:
+        ax.text(0.5, 0.5, "No misclassified samples", ha="center", va="center", fontsize=11)
+        ax.set_title(name, fontsize=12, fontweight="bold")
+        continue
+
+    error_bias = np.abs(true_labels - pred_probs)
+    bias_0 = error_bias[true_labels == 0]
+    bias_1 = error_bias[true_labels == 1]
+    data = [bias_0, bias_1]
+
+    bp = ax.boxplot(
+        data, positions=[0, 1], widths=0.45, patch_artist=True, showfliers=False,
+        medianprops=dict(color="black", linewidth=1.5)
+    )
+    for patch, color in zip(bp["boxes"], ["lightblue", "lightcoral"]):
+        patch.set_facecolor(color)
+
+    for d_i, pos in zip(data, [0, 1]):
+        if len(d_i) > 0:
+            x = np.random.normal(pos, 0.06, size=len(d_i))
+            ax.scatter(x, d_i, c="black", alpha=0.5, s=10)
+
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(["Class 0", "Class 1"], fontsize=10)
+    ax.set_ylabel("Error Bias", fontsize=11)
+    ax.set_title(name, fontsize=12, fontweight="bold")
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(alpha=0.25)
+plt.suptitle("Error Bias (Misclassified Samples)", fontsize=14, fontweight="bold")
+plt.tight_layout()
+plt.show()
+
+# ==================== 4. SHAP可解释性分析 (基于筛选后的拓扑核心特征) ====================
+import shap
+
+print("\n🔍 正在针对高性能模型进行 SHAP 可解释性归因计算...")
+shap_results = {}
+
+for model_name in top2_models:
+    final_model = models[model_name]
+    final_model.fit(X_leaked, y)  # 模型的全量拓扑拟合
+
+    print(f"正在计算 {model_name} 的全局 SHAP 贡献度...")
+
+    if model_name in ["RF"]:
+        explainer = shap.TreeExplainer(final_model)
+        shap_values_raw = explainer.shap_values(X_leaked)
+    elif model_name == "RidgeClass":
+        explainer = shap.LinearExplainer(final_model, X_leaked)
+        shap_values_raw = explainer.shap_values(X_leaked)
+    elif model_name in ["SVM", "NaiveBayes"]:
+        explainer = shap.KernelExplainer(final_model.predict_proba, X_leaked)
+        shap_values_raw = explainer.shap_values(X_leaked)
+    else:
+        continue
+
+    if isinstance(shap_values_raw, list):
+        shap_values = shap_values_raw[1] if len(shap_values_raw) > 1 else shap_values_raw[0]
+    elif isinstance(shap_values_raw, np.ndarray) and shap_values_raw.ndim == 3:
+        shap_values = shap_values_raw[:, :, 1]
+    else:
+        shap_values = shap_values_raw
+
+    mean_abs_shap = np.abs(shap_values).mean(axis=0)
+    mean_shap = shap_values.mean(axis=0)
+    std_shap = shap_values.std(axis=0)
+
+    gene_stats = pd.DataFrame({
+        "Gene": leaked_feature_names,
+        "Mean_Abs_SHAP": mean_abs_shap,
+        "Mean_SHAP": mean_shap,
+        "Std_SHAP": std_shap,
+    })
+
+    gene_stats = gene_stats.sort_values("Mean_Abs_SHAP", ascending=False).reset_index(drop=True)
+    gene_stats.index = gene_stats.index + 1
+
+    excel_path = f"SHAP_gene_importance_{model_name}.xlsx"
+    gene_stats.to_excel(excel_path, index=True, index_label="Rank")
+    print(f"已导出特征 SHAP 决策权重度量表至: {excel_path}")
+
+    shap_results[model_name] = (explainer, shap_values)
+
+# 绘制 SHAP 摘要图 (Summary Plot)
+for model_name in top2_models:
+    if model_name not in shap_results:
+        continue
+    explainer, shap_values = shap_results[model_name]
+    print(f"正在绘制 {model_name} 的 SHAP 特征倾向摘要图...")
+    plt.figure()
+    shap.summary_plot(shap_values, X_leaked, feature_names=leaked_feature_names, show=False)
+    plt.title(f"SHAP Summary Plot - {model_name}", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    plt.show()
